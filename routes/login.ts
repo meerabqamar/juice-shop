@@ -1,84 +1,112 @@
-/*
- * Copyright (c) 2014-2026 Bjoern Kimminich & the OWASP Juice Shop contributors.
- * SPDX-License-Identifier: MIT
- */
-import { type Request, type Response, type NextFunction } from 'express'
-import config from 'config'
-
-import * as challengeUtils from '../lib/challengeUtils'
-import { challenges, users } from '../data/datacache'
-import { BasketModel } from '../models/basket'
-import * as security from '../lib/insecurity'
-import { UserModel } from '../models/user'
-import * as models from '../models/index'
-import { type User } from '../data/types'
-import * as utils from '../lib/utils'
-
-// vuln-code-snippet start loginAdminChallenge loginBenderChallenge loginJimChallenge
 export function login () {
-  function afterLogin (user: { data: User, bid: number }, res: Response, next: NextFunction) {
-    verifyPostLoginChallenges(user) // vuln-code-snippet hide-line
-    BasketModel.findOrCreate({ where: { UserId: user.data.id } })
-      .then(([basket]: [BasketModel, boolean]) => {
-        const token = security.authorize(user)
-        user.bid = basket.id // keep track of original basket
-        security.authenticatedUsers.put(token, user)
-        res.json({ authentication: { token, bid: basket.id, umail: user.data.email } })
-      }).catch((error: Error) => {
-        next(error)
-      })
+  async function afterLogin (user: { data: User, bid: number }, res: Response, next: NextFunction) {
+    try {
+      verifyPostLoginChallenges(user)
+      const [basket] = await BasketModel.findOrCreate({ where: { UserId: user.data.id } })
+      const token = security.authorize(user)
+      user.bid = basket.id // keep track of original basket
+      security.authenticatedUsers.put(token, user)
+      res.json({ authentication: { token, bid: basket.id, umail: user.data.email } })
+    } catch (error) {
+      next(error)
+    }
   }
 
-  return (req: Request, res: Response, next: NextFunction) => {
-    verifyPreLoginChallenges(req) // vuln-code-snippet hide-line
-    models.sequelize.query(`SELECT * FROM Users WHERE email = '${req.body.email || ''}' AND password = '${security.hash(req.body.password || '')}' AND deletedAt IS NULL`, { model: UserModel, plain: true }) // vuln-code-snippet vuln-line loginAdminChallenge loginBenderChallenge loginJimChallenge
-      .then((authenticatedUser) => { // vuln-code-snippet neutral-line loginAdminChallenge loginBenderChallenge loginJimChallenge
-        const user = utils.queryResultToJson(authenticatedUser)
-        if (user.data?.id && user.data.totpSecret !== '') {
-          res.status(401).json({
-            status: 'totp_token_required',
-            data: {
-              tmpToken: security.authorize({
-                userId: user.data.id,
-                type: 'password_valid_needs_second_factor_token'
-              })
-            }
-          })
-        } else if (user.data?.id) {
-          // @ts-expect-error FIXME some properties missing in user - vuln-code-snippet hide-line
-          afterLogin(user, res, next)
-        } else {
-          res.status(401).send(res.__('Invalid email or password.'))
+  return async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      verifyPreLoginChallenges(req)
+
+      const email = (req.body.email || '').toString().trim()
+      const password = (req.body.password || '').toString()
+
+      // Basic input sanity check
+      if (!email || !password) {
+        // avoid leaking whether email exists
+        return res.status(401).send(res.__('Invalid email or password.'))
+      }
+
+      // Find user by email only (parameterized by Sequelize)
+      const userRecord = await UserModel.findOne({
+        where: {
+          email,
+          deletedAt: null
+        },
+        raw: true
+      })
+
+      // If no user found, still perform a fake hash and compare to mitigate timing attacks
+      const suppliedHash = security.hash(password)
+
+      if (!userRecord) {
+        // constant-time comparison with a dummy buffer to mitigate timing differences
+        // create dummy hash buffer (same length as suppliedHash) to compare
+        // Node's crypto.timingSafeEqual requires two Buffers of same length
+        try {
+          const dummy = Buffer.alloc(Buffer.from(suppliedHash).length, 0)
+          const supplied = Buffer.from(suppliedHash)
+          // If lengths differ this will throw — catch below and return generic 401
+          if (dummy.length === supplied.length) {
+            crypto.timingSafeEqual(dummy, supplied)
+          }
+        } catch {
+          // ignore — we just want to burn comparable time
         }
-      }).catch((error: Error) => {
-        next(error)
-      })
-  }
-  // vuln-code-snippet end loginAdminChallenge loginBenderChallenge loginJimChallenge
+        return res.status(401).send(res.__('Invalid email or password.'))
+      }
 
-  function verifyPreLoginChallenges (req: Request) {
-    challengeUtils.solveIf(challenges.weakPasswordChallenge, () => { return req.body.email === 'admin@' + config.get<string>('application.domain') && req.body.password === 'admin123' })
-    challengeUtils.solveIf(challenges.loginSupportChallenge, () => { return req.body.email === 'support@' + config.get<string>('application.domain') && req.body.password === 'J6aVjTgOpRs@?5l!Zkq2AYnCE@RF$P' })
-    challengeUtils.solveIf(challenges.loginRapperChallenge, () => { return req.body.email === 'mc.safesearch@' + config.get<string>('application.domain') && req.body.password === 'Mr. N00dles' })
-    challengeUtils.solveIf(challenges.loginAmyChallenge, () => { return req.body.email === 'amy@' + config.get<string>('application.domain') && req.body.password === 'K1f.....................' })
-    challengeUtils.solveIf(challenges.dlpPasswordSprayingChallenge, () => { return req.body.email === 'J12934@' + config.get<string>('application.domain') && req.body.password === '0Y8rMnww$*9VFYE§59-!Fg1L6t&6lB' })
-    challengeUtils.solveIf(challenges.oauthUserPasswordChallenge, () => { return req.body.email === 'bjoern.kimminich@gmail.com' && req.body.password === 'bW9jLmxpYW1nQGhjaW5pbW1pay5ucmVvamI=' })
-    challengeUtils.solveIf(challenges.exposedCredentialsChallenge, () => { return req.body.email === 'testing@' + config.get<string>('application.domain') && req.body.password === 'IamUsedForTesting' })
-  }
+      // Compare hashed password in constant-time
+      const storedHash = (userRecord as any).password || ''
+      const bufA = Buffer.from(storedHash)
+      const bufB = Buffer.from(suppliedHash)
 
-  function verifyPostLoginChallenges (user: { data: User }) {
-    challengeUtils.solveIf(challenges.loginAdminChallenge, () => { return user.data.id === users.admin.id })
-    challengeUtils.solveIf(challenges.loginJimChallenge, () => { return user.data.id === users.jim.id })
-    challengeUtils.solveIf(challenges.loginBenderChallenge, () => { return user.data.id === users.bender.id })
-    challengeUtils.solveIf(challenges.ghostLoginChallenge, () => { return user.data.id === users.chris.id })
-    if (challengeUtils.notSolved(challenges.ephemeralAccountantChallenge) && user.data.email === 'acc0unt4nt@' + config.get<string>('application.domain') && user.data.role === 'accounting') {
-      UserModel.count({ where: { email: 'acc0unt4nt@' + config.get<string>('application.domain') } }).then((count: number) => {
-        if (count === 0) {
-          challengeUtils.solve(challenges.ephemeralAccountantChallenge)
+      // Ensure buffers same length; if not, create padded copies so timingSafeEqual won't throw
+      let equal = false
+      if (bufA.length === bufB.length) {
+        try {
+          equal = crypto.timingSafeEqual(bufA, bufB)
+        } catch {
+          equal = false
         }
-      }).catch(() => {
-        throw new Error('Unable to verify challenges! Try again')
-      })
+      } else {
+        // pad the shorter one with zeros so lengths match, then compare
+        const maxLen = Math.max(bufA.length, bufB.length)
+        const a = Buffer.alloc(maxLen, 0)
+        const b = Buffer.alloc(maxLen, 0)
+        bufA.copy(a, 0)
+        bufB.copy(b, 0)
+        try {
+          equal = crypto.timingSafeEqual(a, b)
+        } catch {
+          equal = false
+        }
+      }
+
+      if (!equal) {
+        return res.status(401).send(res.__('Invalid email or password.'))
+      }
+
+      // At this point we have a valid user and password
+      const user = utils.queryResultToJson(userRecord)
+      if (user.data?.id && user.data.totpSecret !== '') {
+        res.status(401).json({
+          status: 'totp_token_required',
+          data: {
+            tmpToken: security.authorize({
+              userId: user.data.id,
+              type: 'password_valid_needs_second_factor_token'
+            })
+          }
+        })
+      } else if (user.data?.id) {
+        // @ts-expect-error some properties missing in user object
+        await afterLogin(user, res, next)
+      } else {
+        return res.status(401).send(res.__('Invalid email or password.'))
+      }
+    } catch (error) {
+      // Don't propagate raw DB errors to client — keep generic message
+      next(error)
     }
   }
 }
+
