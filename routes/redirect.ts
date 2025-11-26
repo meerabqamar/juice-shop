@@ -1,33 +1,30 @@
-/*
- * Copyright (c) 2014-2026 Bjoern Kimminich & the OWASP Juice Shop contributors.
- * SPDX-License-Identifier: MIT
- */
-
 import { type Request, type Response, type NextFunction } from 'express'
-
-import * as challengeUtils from '../lib/challengeUtils'
-import { challenges } from '../data/datacache'
-import * as security from '../lib/insecurity'
-import * as utils from '../lib/utils'
+import { URL } from 'url'
 
 export function performRedirect () {
-  return ({ query }: Request, res: Response, next: NextFunction) => {
-    const toUrl: string = query.to as string
-    if (security.isRedirectAllowed(toUrl)) {
-      challengeUtils.solveIf(challenges.redirectCryptoCurrencyChallenge, () => { return toUrl === 'https://explorer.dash.org/address/Xr556RzuwX6hg5EGpkybbv5RanJoZN17kW' || toUrl === 'https://blockchain.info/address/1AbKfgvw9psQ41NbLi8kufDQTezwG8DRZm' || toUrl === 'https://etherscan.io/address/0x0f933ab9fcaaa782d0279c300d73750e1311eae6' })
-      challengeUtils.solveIf(challenges.redirectChallenge, () => { return isUnintendedRedirect(toUrl) })
-      res.redirect(toUrl)
-    } else {
-      res.status(406)
-      next(new Error('Unrecognized target URL for redirect: ' + toUrl))
+  return (req: Request, res: Response, next: NextFunction) => {
+    const toUrl = (req.query.to as string) || ''
+
+    try {
+      // Normalize and parse URL safely
+      const parsed = new URL(toUrl, process.env.APP_URL || 'http://localhost:3000')
+
+      // Only allow same-origin redirects
+      const allowedHostname = new URL(process.env.APP_URL || 'http://localhost:3000').hostname
+
+      if (parsed.hostname !== allowedHostname) {
+        return res.status(400).json({ error: 'External redirects are not allowed.' })
+      }
+
+      // Prevent redirecting to dangerous paths
+      if (!parsed.pathname.startsWith('/')) {
+        return res.status(400).json({ error: 'Invalid redirect path.' })
+      }
+
+      return res.redirect(parsed.pathname + parsed.search)
+    } catch {
+      return res.status(400).json({ error: 'Invalid redirect URL.' })
     }
   }
 }
 
-function isUnintendedRedirect (toUrl: string) {
-  let unintended = true
-  for (const allowedUrl of security.redirectAllowlist) {
-    unintended = unintended && !utils.startsWith(toUrl, allowedUrl)
-  }
-  return unintended
-}
